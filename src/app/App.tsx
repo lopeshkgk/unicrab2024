@@ -125,84 +125,89 @@ const DEFAULT_EDITAIS: Edital[] = [
   },
 ];
 
-// ─── Supabase via Edge Function (CORS * + service role) ──────────────────────
-const sb = createClient(
-  "https://mabvcstrksqmcdkozkwv.supabase.co",
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1hYnZjc3Rya3NxbWNka296a3d2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg5MTk4NDMsImV4cCI6MjEwNDQ5NTg0M30.DMjCZt2NgNtPXJyyXLNvLZWKwOjY_09CrV6XXfUUHOk"
-);
-const EDGE = "https://mabvcstrksqmcdkozkwv.supabase.co/functions/v1/server";
+// ─── Supabase sync: tries direct REST, falls back to edge function ─────────────
+const PROJ = "mabvcstrksqmcdkozkwv";
 const ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1hYnZjc3Rya3NxbWNka296a3d2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg5MTk4NDMsImV4cCI6MjEwNDQ5NTg0M30.DMjCZt2NgNtPXJyyXLNvLZWKwOjY_09CrV6XXfUUHOk";
-const KV_TABLE = "kv_store_9255bd65";
+const REST  = `https://${PROJ}.supabase.co/rest/v1/kv_store_9255bd65`;
+const EDGE  = `https://${PROJ}.supabase.co/functions/v1/server/make-server-9255bd65/kv`;
+const HDRS  = { apikey: ANON, Authorization: `Bearer ${ANON}`, "Content-Type": "application/json" };
+
+const g = globalThis as any;
+const sb = g.__unicrab_sb ??= createClient(`https://${PROJ}.supabase.co`, ANON);
 
 async function dbGet(key: string): Promise<any> {
+  // 1. try Supabase REST (select)
   try {
-    const r = await fetch(`${EDGE}/make-server-9255bd65/kv/${key}`, {
-      headers: { Authorization: `Bearer ${ANON}` },
-    });
-    if (!r.ok) return null;
-    const d = await r.json();
-    return d.value ?? null;
-  } catch { return null; }
+    const r = await fetch(`${REST}?key=eq.${encodeURIComponent(key)}&select=value`, { headers: HDRS });
+    if (r.ok) { const d = await r.json(); if (d?.[0]?.value !== undefined) return d[0].value; }
+  } catch {}
+  // 2. try edge function
+  try {
+    const r = await fetch(`${EDGE}/${key}`, { headers: HDRS });
+    if (r.ok) { const d = await r.json(); return d.value ?? null; }
+  } catch {}
+  return null;
 }
 
-async function dbSet(key: string, value: any): Promise<{ ok: boolean; error?: string }> {
+async function dbSet(key: string, value: any): Promise<boolean> {
+  // 1. try Supabase REST (upsert)
   try {
-    const r = await fetch(`${EDGE}/make-server-9255bd65/kv/${key}`, {
+    const r = await fetch(REST, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${ANON}` },
+      headers: { ...HDRS, Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify({ key, value }),
+    });
+    if (r.ok || r.status === 204) return true;
+  } catch {}
+  // 2. try edge function
+  try {
+    const r = await fetch(`${EDGE}/${key}`, {
+      method: "POST", headers: HDRS,
       body: JSON.stringify({ value }),
     });
-    if (!r.ok) {
-      const d = await r.json().catch(() => ({}));
-      return { ok: false, error: d.error || `HTTP ${r.status}` };
-    }
-    return { ok: true };
-  } catch (e: any) {
-    return { ok: false, error: e.message };
-  }
+    if (r.ok) return true;
+  } catch {}
+  return false;
 }
 
-// useStore: instant local render → load from DB on mount → save to DB on change
-// Realtime: supabase-js postgres_changes subscription + 10s polling as fallback
+// useStore: instant from localStorage → sync from DB on mount → write to DB on change
+// Realtime push via supabase-js channel, polling every 6s as universal fallback.
 function useStore<T>(key: string, defaultVal: T): [T, (v: T) => void] {
   const [val, setVal] = useState<T>(() => {
-    try {
-      const s = localStorage.getItem(key);
-      return s ? JSON.parse(s) : defaultVal;
-    } catch { return defaultVal; }
+    try { const s = localStorage.getItem(key); return s ? JSON.parse(s) : defaultVal; }
+    catch { return defaultVal; }
   });
 
-  const applyCloud = (cloudVal: any) => {
-    if (cloudVal === null || cloudVal === undefined) return;
-    const cloudStr = JSON.stringify(cloudVal);
-    if (cloudStr === localStorage.getItem(key)) return;
-    setVal(cloudVal);
-    localStorage.setItem(key, cloudStr);
+  const apply = (v: any) => {
+    if (v === null || v === undefined) return;
+    const s = JSON.stringify(v);
+    if (s === localStorage.getItem(key)) return;
+    setVal(v); localStorage.setItem(key, s);
   };
 
   useEffect(() => {
-    // Initial load from DB
-    dbGet(key).then(applyCloud);
+    dbGet(key).then(apply);
 
-    // Supabase Realtime: fires instantly when another device saves
-    const channel = sb
-      .channel(`kv-${key}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: KV_TABLE, filter: `key=eq.${key}` },
-        (payload: any) => applyCloud(payload.new?.value)
-      )
+    // Supabase Realtime broadcast — fires the moment another device saves
+    const ch = sb.channel(`unicrab-${key}`)
+      .on("broadcast", { event: "change" }, (msg: any) => apply(msg.payload?.value))
+      .on("postgres_changes", { event: "*", schema: "public", table: "kv_store_9255bd65", filter: `key=eq.${key}` },
+        (p: any) => apply(p.new?.value))
       .subscribe();
 
-    // Polling fallback: every 8s re-fetch in case realtime isn't enabled on table
-    const poll = setInterval(() => dbGet(key).then(applyCloud), 8000);
+    // Polling every 6 s — works even if realtime is not enabled on the table
+    const poll = setInterval(() => dbGet(key).then(apply), 6000);
 
-    return () => { sb.removeChannel(channel); clearInterval(poll); };
+    return () => { sb.removeChannel(ch); clearInterval(poll); };
   }, [key]);
 
   const set = (v: T) => {
-    setVal(v);
-    localStorage.setItem(key, JSON.stringify(v));
-    dbSet(key, v).then(res => {
-      if (!res.ok) toast.error("Erro ao salvar: verifique o deploy do servidor.");
+    setVal(v); localStorage.setItem(key, JSON.stringify(v));
+    // Broadcast to other open sessions instantly via realtime
+    sb.channel(`unicrab-${key}`).send({ type: "broadcast", event: "change", payload: { value: v } });
+    // Persist to DB (tries REST then edge function)
+    dbSet(key, v).then(ok => {
+      if (!ok) toast.error("Salvo localmente. Para sincronizar todos os dispositivos, acesse Make Settings → Supabase → Deploy.", { duration: 6000 });
     });
   };
 
