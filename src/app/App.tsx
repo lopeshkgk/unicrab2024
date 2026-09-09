@@ -125,23 +125,28 @@ const DEFAULT_EDITAIS: Edital[] = [
   },
 ];
 
-// ─── Supabase sync: tries direct REST, falls back to edge function ─────────────
+// ─── Supabase — fonte oficial de dados ────────────────────────────────────────
 const PROJ = "mabvcstrksqmcdkozkwv";
 const ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1hYnZjc3Rya3NxbWNka296a3d2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg5MTk4NDMsImV4cCI6MjEwNDQ5NTg0M30.DMjCZt2NgNtPXJyyXLNvLZWKwOjY_09CrV6XXfUUHOk";
-const REST  = `https://${PROJ}.supabase.co/rest/v1/kv_store_9255bd65`;
 const EDGE  = `https://${PROJ}.supabase.co/functions/v1/server/make-server-9255bd65/kv`;
 const HDRS  = { apikey: ANON, Authorization: `Bearer ${ANON}`, "Content-Type": "application/json" };
+const TABLE = "kv_store_9255bd65";
 
+// Singleton supabase client — prevents multiple GoTrueClient instances on HMR
 const g = globalThis as any;
-const sb = g.__unicrab_sb ??= createClient(`https://${PROJ}.supabase.co`, ANON);
+const sb = g.__unicrab_sb ??= createClient(`https://${PROJ}.supabase.co`, ANON, {
+  auth: { persistSession: false },
+  realtime: { params: { eventsPerSecond: 10 } },
+});
 
 async function dbGet(key: string): Promise<any> {
-  // 1. try Supabase REST (select)
+  // Primary: supabase-js (browser sets Origin correctly, handles auth headers)
   try {
-    const r = await fetch(`${REST}?key=eq.${encodeURIComponent(key)}&select=value`, { headers: HDRS });
-    if (r.ok) { const d = await r.json(); if (d?.[0]?.value !== undefined) return d[0].value; }
-  } catch {}
-  // 2. try edge function
+    const { data, error } = await sb.from(TABLE).select("value").eq("key", key).maybeSingle();
+    if (!error && data?.value !== undefined) return data.value;
+    if (error) console.warn("[unicrab] dbGet supabase error:", error.message);
+  } catch (e) { console.warn("[unicrab] dbGet exception:", e); }
+  // Fallback: edge function (uses service role key, bypasses all restrictions)
   try {
     const r = await fetch(`${EDGE}/${key}`, { headers: HDRS });
     if (r.ok) { const d = await r.json(); return d.value ?? null; }
@@ -150,16 +155,13 @@ async function dbGet(key: string): Promise<any> {
 }
 
 async function dbSet(key: string, value: any): Promise<boolean> {
-  // 1. try Supabase REST (upsert)
+  // Primary: supabase-js upsert (browser Origin header is set correctly)
   try {
-    const r = await fetch(REST, {
-      method: "POST",
-      headers: { ...HDRS, Prefer: "resolution=merge-duplicates,return=minimal" },
-      body: JSON.stringify({ key, value }),
-    });
-    if (r.ok || r.status === 204) return true;
-  } catch {}
-  // 2. try edge function
+    const { error } = await sb.from(TABLE).upsert({ key, value }, { onConflict: "key" });
+    if (!error) return true;
+    console.warn("[unicrab] dbSet supabase error:", error.message, error.code);
+  } catch (e) { console.warn("[unicrab] dbSet exception:", e); }
+  // Fallback: edge function (server-side, bypasses CORS + RLS)
   try {
     const r = await fetch(`${EDGE}/${key}`, {
       method: "POST", headers: HDRS,
@@ -170,44 +172,77 @@ async function dbSet(key: string, value: any): Promise<boolean> {
   return false;
 }
 
-// useStore: instant from localStorage → sync from DB on mount → write to DB on change
-// Realtime push via supabase-js channel, polling every 6s as universal fallback.
-function useStore<T>(key: string, defaultVal: T): [T, (v: T) => void] {
-  const [val, setVal] = useState<T>(() => {
-    try { const s = localStorage.getItem(key); return s ? JSON.parse(s) : defaultVal; }
-    catch { return defaultVal; }
-  });
+// Canal realtime — escuta alterações no banco e notifica outros dispositivos abertos
+function makeChannel(key: string) {
+  return sb.channel(`unicrab-store-${key}`);
+}
 
-  const apply = (v: any) => {
-    if (v === null || v === undefined) return;
-    const s = JSON.stringify(v);
-    if (s === localStorage.getItem(key)) return;
-    setVal(v); localStorage.setItem(key, s);
+// useStore: carrega do banco na montagem → grava no banco ao alterar
+// Realtime WebSocket como mecanismo principal de sync entre dispositivos abertos
+// Polling de 20s apenas como fallback de segurança
+function useStore<T>(key: string, defaultVal: T): [T, (v: T) => void] {
+  const [val, setVal] = useState<T>(defaultVal);
+  const latestVal = useRef<string>("");
+  const channelRef = useRef<any>(null);
+
+  const apply = (incoming: any) => {
+    if (incoming === null || incoming === undefined) return;
+    const s = JSON.stringify(incoming);
+    if (s === latestVal.current) return; // já aplicado, ignorar
+    latestVal.current = s;
+    setVal(incoming);
+    // Atualiza localStorage como cache para carregamento rápido inicial
+    try { localStorage.setItem(key, s); } catch {}
   };
 
   useEffect(() => {
+    // Carrega cache local para render imediato (antes do banco responder)
+    try {
+      const cached = localStorage.getItem(key);
+      if (cached) { const parsed = JSON.parse(cached); latestVal.current = cached; setVal(parsed); }
+    } catch {}
+
+    // Carrega do banco (fonte oficial)
     dbGet(key).then(apply);
 
-    // Supabase Realtime broadcast — fires the moment another device saves
-    const ch = sb.channel(`unicrab-${key}`)
+    // Realtime: postgres_changes = altera quando o banco é atualizado (qualquer origem)
+    // broadcast = notifica dispositivos no mesmo canal em tempo real
+    const ch = makeChannel(key)
       .on("broadcast", { event: "change" }, (msg: any) => apply(msg.payload?.value))
-      .on("postgres_changes", { event: "*", schema: "public", table: "kv_store_9255bd65", filter: `key=eq.${key}` },
-        (p: any) => apply(p.new?.value))
+      .on("postgres_changes", {
+        event: "*", schema: "public", table: TABLE, filter: `key=eq.${key}`,
+      }, (p: any) => { if (p.new?.value !== undefined) apply(p.new.value); })
       .subscribe();
+    channelRef.current = ch;
 
-    // Polling every 6 s — works even if realtime is not enabled on the table
-    const poll = setInterval(() => dbGet(key).then(apply), 6000);
+    // Polling de 20s — fallback para quando o realtime não está disponível
+    const poll = setInterval(() => dbGet(key).then(apply), 20000);
 
-    return () => { sb.removeChannel(ch); clearInterval(poll); };
+    return () => {
+      sb.removeChannel(ch);
+      clearInterval(poll);
+    };
   }, [key]);
 
   const set = (v: T) => {
-    setVal(v); localStorage.setItem(key, JSON.stringify(v));
-    // Broadcast to other open sessions instantly via realtime
-    sb.channel(`unicrab-${key}`).send({ type: "broadcast", event: "change", payload: { value: v } });
-    // Persist to DB (tries REST then edge function)
+    apply(v); // aplica localmente de imediato
+
+    // Notifica outros dispositivos abertos via WebSocket (instantâneo)
+    if (channelRef.current) {
+      channelRef.current.send({ type: "broadcast", event: "change", payload: { value: v } });
+    }
+
+    // Grava no banco de dados (fonte oficial — persiste globalmente)
     dbSet(key, v).then(ok => {
-      if (!ok) toast.error("Salvo localmente. Para sincronizar todos os dispositivos, acesse Make Settings → Supabase → Deploy.", { duration: 6000 });
+      if (!ok) {
+        toast.error(
+          "Não foi possível salvar no banco de dados. Verifique a conexão com o Supabase.",
+          {
+            duration: 8000,
+            action: { label: "Tentar novamente", onClick: () => dbSet(key, v) },
+          }
+        );
+      }
     });
   };
 
@@ -1185,82 +1220,103 @@ function AdminPanel({ news, setNews, heroImg, setHeroImg, editais, setEditais, p
   const [tab, setTab] = useState<"noticias" | "fotos" | "nova" | "editais" | "novo-edital" | "projetos" | "novo-projeto">("noticias");
   const [editing, setEditing] = useState<NewsItem | null>(null);
   const [newHero, setNewHero] = useState(heroImg);
+  const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [dbOk, setDbOk] = useState<boolean | null>(null); // null = checking
 
-  // Form state for new/edit news
+  // Test DB write access on mount
+  useEffect(() => {
+    dbSet("unicrab-ping", Date.now()).then(ok => setDbOk(ok));
+  }, []);
+
+  // ── Forms ──────────────────────────────────────────────────────────────────
   const emptyForm = { id: "", categoria: "Institucional", titulo: "", data: new Date().toLocaleDateString("pt-BR"), fonte: "UNICRAB", img: "", destaque: false, link: "" };
   const [form, setForm] = useState<NewsItem>({ ...emptyForm });
+  const isSavingNews = useRef(false);
 
-  // Editais state
   const emptyEdital: Edital = { id: "", titulo: "", numero: "", objeto: "", dataAbertura: "", dataEncerramento: "", status: "Aberto", arquivo: "", orgao: "" };
   const [editingEdital, setEditingEdital] = useState<Edital | null>(null);
   const [editalForm, setEditalForm] = useState<Edital>({ ...emptyEdital });
+  const isSavingEdital = useRef(false);
 
-  const startEditEdital = (e: Edital) => { setEditingEdital(e); setEditalForm({ ...e }); setTab("novo-edital"); };
-  const cancelEdital = () => { setEditingEdital(null); setEditalForm({ ...emptyEdital }); setTab("editais"); };
-  const saveEdital = () => {
-    if (!editalForm.titulo || !editalForm.numero) { toast.error("Preencha título e número do edital."); return; }
-    if (editingEdital) {
-      setEditais(editais.map(e => e.id === editingEdital.id ? { ...editalForm } : e));
-      toast.success("Edital atualizado com sucesso!");
-    } else {
-      setEditais([{ ...editalForm, id: Date.now().toString() }, ...editais]);
-      toast.success("Edital publicado com sucesso!");
-    }
-    cancelEdital();
-  };
-  const deleteEdital = (id: string) => {
-    if (confirm("Excluir este edital?")) { setEditais(editais.filter(e => e.id !== id)); toast.success("Edital excluído."); }
-  };
-
-  const startEdit = (n: NewsItem) => { setEditing(n); setForm({ ...n }); setTab("nova"); };
-  const cancelEdit = () => { setEditing(null); setForm({ ...emptyForm }); setTab("noticias"); };
-
-  const saveNews = () => {
-    if (!form.titulo || !form.categoria) { toast.error("Preencha título e categoria."); return; }
-    if (editing) {
-      setNews(news.map(n => n.id === editing.id ? { ...form } : n));
-      toast.success("Notícia atualizada com sucesso!");
-    } else {
-      const novaNoticia = { ...form, id: Date.now().toString() };
-      setNews([novaNoticia, ...news]);
-      toast.success("Notícia publicada com sucesso!");
-    }
-    cancelEdit();
-  };
-
-  const deleteNews = (id: string) => {
-    if (confirm("Tem certeza que deseja excluir esta notícia?")) {
-      setNews(news.filter(n => n.id !== id));
-      toast.success("Notícia excluída.");
-    }
-  };
-
-  const toggleDestaque = (id: string) => {
-    setNews(news.map(n => n.id === id ? { ...n, destaque: !n.destaque } : n));
-    toast.success("Destaque atualizado.");
-  };
-
-  const saveHero = () => {
-    setHeroImg(newHero);
-    toast.success("Foto do hero atualizada em tempo real!");
-  };
-
-  // ── Projeto state ──
   const emptyProjeto: Projeto = { id: "", titulo: "", resumo: "", territorio: "", parceiros: "", status: "Em andamento", tema: "Institucional", img: "", link: "" };
   const [editingProjeto, setEditingProjeto] = useState<Projeto | null>(null);
   const [projetoForm, setProjetoForm] = useState<Projeto>({ ...emptyProjeto });
+  const isSavingProjeto = useRef(false);
+
+  // ── Auto-save: Notícias (1.5s debounce) ────────────────────────────────────
+  useEffect(() => {
+    if (tab !== "nova" || !form.titulo || isSavingNews.current) return;
+    setSaveStatus("saving");
+    const t = setTimeout(() => {
+      isSavingNews.current = true;
+      const id = form.id || Date.now().toString();
+      const item = { ...form, id };
+      setNews(prev => prev.some(n => n.id === id) ? prev.map(n => n.id === id ? item : n) : [item, ...prev]);
+      if (!form.id) { setForm(item); setEditing(item); }
+      setSaveStatus("saved");
+      setTimeout(() => { setSaveStatus("idle"); isSavingNews.current = false; }, 2500);
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [form.titulo, form.categoria, form.fonte, form.data, form.img, form.link, form.destaque, tab]);
+
+  // ── Auto-save: Editais (1.5s debounce) ─────────────────────────────────────
+  useEffect(() => {
+    if (tab !== "novo-edital" || !editalForm.titulo || !editalForm.numero || isSavingEdital.current) return;
+    setSaveStatus("saving");
+    const t = setTimeout(() => {
+      isSavingEdital.current = true;
+      const id = editalForm.id || Date.now().toString();
+      const item = { ...editalForm, id };
+      setEditais(prev => prev.some(e => e.id === id) ? prev.map(e => e.id === id ? item : e) : [item, ...prev]);
+      if (!editalForm.id) { setEditalForm(item); setEditingEdital(item); }
+      setSaveStatus("saved");
+      setTimeout(() => { setSaveStatus("idle"); isSavingEdital.current = false; }, 2500);
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [editalForm.titulo, editalForm.numero, editalForm.objeto, editalForm.status, editalForm.orgao, editalForm.dataAbertura, editalForm.dataEncerramento, editalForm.arquivo, tab]);
+
+  // ── Auto-save: Projetos (1.5s debounce) ────────────────────────────────────
+  useEffect(() => {
+    if (tab !== "novo-projeto" || !projetoForm.titulo || isSavingProjeto.current) return;
+    setSaveStatus("saving");
+    const t = setTimeout(() => {
+      isSavingProjeto.current = true;
+      const id = projetoForm.id || Date.now().toString();
+      const item = { ...projetoForm, id };
+      setProjectos(prev => prev.some(p => p.id === id) ? prev.map(p => p.id === id ? item : p) : [item, ...prev]);
+      if (!projetoForm.id) { setProjetoForm(item); setEditingProjeto(item); }
+      setSaveStatus("saved");
+      setTimeout(() => { setSaveStatus("idle"); isSavingProjeto.current = false; }, 2500);
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [projetoForm.titulo, projetoForm.resumo, projetoForm.territorio, projetoForm.parceiros, projetoForm.tema, projetoForm.status, projetoForm.img, projetoForm.link, tab]);
+
+  // ── Auto-save: Hero image (1s debounce) ────────────────────────────────────
+  useEffect(() => {
+    if (tab !== "fotos" || !newHero || newHero === heroImg) return;
+    const t = setTimeout(() => { setHeroImg(newHero); setSaveStatus("saved"); setTimeout(() => setSaveStatus("idle"), 2500); }, 1000);
+    return () => clearTimeout(t);
+  }, [newHero, tab]);
+
+  // ── Navigation helpers ──────────────────────────────────────────────────────
+  const startEdit = (n: NewsItem) => { setEditing(n); setForm({ ...n }); setTab("nova"); };
+  const cancelEdit = () => { setEditing(null); setForm({ ...emptyForm }); isSavingNews.current = false; setTab("noticias"); };
+
+  const startEditEdital = (e: Edital) => { setEditingEdital(e); setEditalForm({ ...e }); setTab("novo-edital"); };
+  const cancelEdital = () => { setEditingEdital(null); setEditalForm({ ...emptyEdital }); isSavingEdital.current = false; setTab("editais"); };
+
   const startEditProjeto = (p: Projeto) => { setEditingProjeto(p); setProjetoForm({ ...p }); setTab("novo-projeto"); };
-  const cancelProjeto = () => { setEditingProjeto(null); setProjetoForm({ ...emptyProjeto }); setTab("projetos"); };
-  const saveProjeto = () => {
-    if (!projetoForm.titulo) { toast.error("Preencha o título do projeto."); return; }
-    if (editingProjeto) {
-      setProjectos(projetos.map(p => p.id === editingProjeto.id ? { ...projetoForm } : p));
-      toast.success("Projeto atualizado com sucesso!");
-    } else {
-      setProjectos([{ ...projetoForm, id: Date.now().toString() }, ...projetos]);
-      toast.success("Projeto publicado com sucesso!");
-    }
-    cancelProjeto();
+  const cancelProjeto = () => { setEditingProjeto(null); setProjetoForm({ ...emptyProjeto }); isSavingProjeto.current = false; setTab("projetos"); };
+
+  // ── Delete helpers ──────────────────────────────────────────────────────────
+  const deleteNews = (id: string) => {
+    if (confirm("Tem certeza que deseja excluir esta notícia?")) { setNews(news.filter(n => n.id !== id)); toast.success("Notícia excluída."); }
+  };
+  const toggleDestaque = (id: string) => {
+    setNews(news.map(n => n.id === id ? { ...n, destaque: !n.destaque } : n)); toast.success("Destaque atualizado.");
+  };
+  const deleteEdital = (id: string) => {
+    if (confirm("Excluir este edital?")) { setEditais(editais.filter(e => e.id !== id)); toast.success("Edital excluído."); }
   };
   const deleteProjeto = (id: string) => {
     if (confirm("Excluir este projeto?")) { setProjectos(projetos.filter(p => p.id !== id)); toast.success("Projeto excluído."); }
@@ -1281,9 +1337,36 @@ function AdminPanel({ news, setNews, heroImg, setHeroImg, editais, setEditais, p
         <div className="flex items-center gap-4">
           <UnicrabLogo size={32} white />
           <div className="h-6 w-px bg-white/20" />
-          <div className="flex items-center gap-2">
-            <Settings size={16} className="text-white/70" />
-            <span className="text-white font-bold text-sm">Painel Administrativo</span>
+          <div className="flex items-center gap-3 flex-wrap">
+            <div className="flex items-center gap-2">
+              <Settings size={16} className="text-white/70" />
+              <span className="text-white font-bold text-sm">Painel Administrativo</span>
+            </div>
+            {/* DB connectivity badge */}
+            {dbOk === true && (
+              <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold" style={{ backgroundColor: "rgba(126,178,41,0.2)", color: "#7EB229" }}>
+                <span className="w-1.5 h-1.5 rounded-full bg-current" /> Banco conectado
+              </span>
+            )}
+            {dbOk === false && (
+              <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold cursor-help" title="Acesse: Make Settings → Supabase → Deploy Edge Functions"
+                style={{ backgroundColor: "rgba(228,34,50,0.2)", color: "#ff6b6b" }}>
+                ⚠ Banco offline — Make Settings → Supabase → Deploy
+              </span>
+            )}
+            {/* Auto-save indicator */}
+            {saveStatus === "saving" && (
+              <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold animate-pulse"
+                style={{ backgroundColor: "rgba(255,255,255,0.1)", color: "rgba(255,255,255,0.7)" }}>
+                <span className="w-1.5 h-1.5 rounded-full bg-yellow-400 animate-ping inline-block" /> Salvando...
+              </span>
+            )}
+            {saveStatus === "saved" && (
+              <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold"
+                style={{ backgroundColor: "rgba(126,178,41,0.2)", color: "#7EB229" }}>
+                ✓ Salvo e publicado
+              </span>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-3">
@@ -1369,10 +1452,11 @@ function AdminPanel({ news, setNews, heroImg, setHeroImg, editais, setEditais, p
         {/* ── TAB: Nova / Editar Notícia ── */}
         {tab === "nova" && (
           <div>
-            <div className="flex items-center gap-3 mb-6">
+            <div className="flex items-center gap-3 mb-2">
               <button onClick={cancelEdit} className="text-white/50 hover:text-white transition-colors"><ChevronDown size={20} className="rotate-90" /></button>
               <h2 className="text-2xl font-black text-white">{editing ? "Editar Notícia" : "Nova Notícia"}</h2>
             </div>
+            {!form.titulo && <p className="text-yellow-400/80 text-xs mb-4 ml-8">Preencha o título para ativar o salvamento automático</p>}
             <div className="rounded-2xl p-6 md:p-8 space-y-5" style={{ backgroundColor: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }}>
               <div className="grid md:grid-cols-2 gap-5">
                 {[
@@ -1424,16 +1508,14 @@ function AdminPanel({ news, setNews, heroImg, setHeroImg, editais, setEditais, p
                 </div>
               </div>
 
-              <div className="flex gap-4 pt-2">
-                <button onClick={saveNews}
-                  className="flex items-center gap-2 px-8 py-3 rounded-full font-bold text-white transition-all hover:opacity-90"
-                  style={{ backgroundColor: C.green }}>
-                  <Save size={16} /> {editing ? "Salvar Alterações" : "Publicar Notícia"}
-                </button>
+              <div className="flex items-center gap-4 pt-2">
+                <p className="text-white/40 text-xs flex items-center gap-1.5 flex-1">
+                  <Save size={12} /> Salvo automaticamente ao digitar
+                </p>
                 <button onClick={cancelEdit}
-                  className="px-8 py-3 rounded-full font-bold transition-all"
-                  style={{ color: "rgba(255,255,255,0.6)", border: "1px solid rgba(255,255,255,0.2)" }}>
-                  Cancelar
+                  className="px-8 py-3 rounded-full font-bold transition-all hover:bg-white/10"
+                  style={{ color: "rgba(255,255,255,0.8)", border: "1px solid rgba(255,255,255,0.2)" }}>
+                  ← Voltar
                 </button>
               </div>
             </div>
@@ -1547,16 +1629,14 @@ function AdminPanel({ news, setNews, heroImg, setHeroImg, editais, setEditais, p
                   </div>
                 </div>
               )}
-              <div className="flex gap-4 pt-2">
-                <button onClick={saveProjeto}
-                  className="flex items-center gap-2 px-8 py-3 rounded-full font-bold text-white hover:opacity-90"
-                  style={{ backgroundColor: C.green, fontFamily: "'Gabarito', sans-serif" }}>
-                  <Save size={16} /> {editingProjeto ? "Salvar Alterações" : "Publicar Projeto"}
-                </button>
+              <div className="flex items-center gap-4 pt-2">
+                <p className="text-white/40 text-xs flex items-center gap-1.5 flex-1" style={{ fontFamily: "'Gabarito', sans-serif" }}>
+                  <Save size={12} /> Salvo automaticamente ao digitar
+                </p>
                 <button onClick={cancelProjeto}
-                  className="px-8 py-3 rounded-full font-bold transition-all"
-                  style={{ color: "rgba(255,255,255,0.6)", border: "1px solid rgba(255,255,255,0.2)", fontFamily: "'Gabarito', sans-serif" }}>
-                  Cancelar
+                  className="px-8 py-3 rounded-full font-bold transition-all hover:bg-white/10"
+                  style={{ color: "rgba(255,255,255,0.8)", border: "1px solid rgba(255,255,255,0.2)", fontFamily: "'Gabarito', sans-serif" }}>
+                  ← Voltar
                 </button>
               </div>
             </div>
@@ -1659,15 +1739,13 @@ function AdminPanel({ news, setNews, heroImg, setHeroImg, editais, setEditais, p
                 </div>
               </div>
               <div className="flex gap-4 pt-2">
-                <button onClick={saveEdital}
-                  className="flex items-center gap-2 px-8 py-3 rounded-full font-bold text-white hover:opacity-90"
-                  style={{ backgroundColor: C.green, fontFamily: "'Gabarito', sans-serif" }}>
-                  <Save size={16} /> {editingEdital ? "Salvar Alterações" : "Publicar Edital"}
-                </button>
+                <p className="text-white/40 text-xs flex items-center gap-1.5 flex-1" style={{ fontFamily: "'Gabarito', sans-serif" }}>
+                  <Save size={12} /> Salvo automaticamente ao digitar
+                </p>
                 <button onClick={cancelEdital}
-                  className="px-8 py-3 rounded-full font-bold transition-all"
-                  style={{ color: "rgba(255,255,255,0.6)", border: "1px solid rgba(255,255,255,0.2)", fontFamily: "'Gabarito', sans-serif" }}>
-                  Cancelar
+                  className="px-8 py-3 rounded-full font-bold transition-all hover:bg-white/10"
+                  style={{ color: "rgba(255,255,255,0.8)", border: "1px solid rgba(255,255,255,0.2)", fontFamily: "'Gabarito', sans-serif" }}>
+                  ← Voltar
                 </button>
               </div>
             </div>
@@ -1680,7 +1758,7 @@ function AdminPanel({ news, setNews, heroImg, setHeroImg, editais, setEditais, p
             <h2 className="text-2xl font-black text-white mb-6">Fotos & Imagens</h2>
             <div className="rounded-2xl p-6 md:p-8" style={{ backgroundColor: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }}>
               <h3 className="text-lg font-black text-white mb-2">Foto do Hero (Banner Principal)</h3>
-              <p className="text-white/50 text-sm mb-5">Cole a URL de uma imagem para atualizar o banner principal do site em tempo real.</p>
+              <p className="text-white/50 text-sm mb-5">Cole a URL de uma imagem — salva automaticamente no banco e atualiza para todos os dispositivos.</p>
               <div className="space-y-4">
                 <div>
                   <label className="block text-sm font-bold mb-2 text-white/70">URL da nova imagem</label>
@@ -1698,11 +1776,9 @@ function AdminPanel({ news, setNews, heroImg, setHeroImg, editais, setEditais, p
                     </div>
                   </div>
                 )}
-                <button onClick={saveHero}
-                  className="flex items-center gap-2 px-8 py-3 rounded-full font-bold text-white"
-                  style={{ backgroundColor: C.lime }}>
-                  <Save size={16} /> Atualizar Banner em Tempo Real
-                </button>
+                <p className="text-white/40 text-xs flex items-center gap-1.5">
+                  <Save size={12} /> Salvo automaticamente após 1 segundo
+                </p>
               </div>
 
               {/* Sugestões Unsplash */}
