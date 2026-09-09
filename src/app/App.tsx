@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { createClient } from "@supabase/supabase-js";
 import mapaImg from "../imports/WhatsApp_Image_2026-08-07_at_08.56.58__1_-1.jpeg";
 import quemSomosImg from "../imports/Rio_Grande_do_Sul_-_Ato_Pol_tico_e_Almo_o__Foto__Priscila_Ramos.jpg";
 import dirEderson from "../imports/WhatsApp_Image_2026-08-31_at_14.20.24__1_.jpeg";
@@ -124,28 +125,45 @@ const DEFAULT_EDITAIS: Edital[] = [
   },
 ];
 
-// ─── Supabase Cloud Store ─────────────────────────────────────────────────────
+// ─── Supabase via Edge Function (CORS * + service role) ──────────────────────
+const sb = createClient(
+  "https://mabvcstrksqmcdkozkwv.supabase.co",
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1hYnZjc3Rya3NxbWNka296a3d2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg5MTk4NDMsImV4cCI6MjEwNDQ5NTg0M30.DMjCZt2NgNtPXJyyXLNvLZWKwOjY_09CrV6XXfUUHOk"
+);
 const EDGE = "https://mabvcstrksqmcdkozkwv.supabase.co/functions/v1/server";
 const ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1hYnZjc3Rya3NxbWNka296a3d2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg5MTk4NDMsImV4cCI6MjEwNDQ5NTg0M30.DMjCZt2NgNtPXJyyXLNvLZWKwOjY_09CrV6XXfUUHOk";
+const KV_TABLE = "kv_store_9255bd65";
 
-async function cloudGet(key: string): Promise<any> {
-  const r = await fetch(`${EDGE}/make-server-9255bd65/kv/${key}`, {
-    headers: { Authorization: `Bearer ${ANON}` },
-  });
-  const d = await r.json();
-  return d.value ?? null;
+async function dbGet(key: string): Promise<any> {
+  try {
+    const r = await fetch(`${EDGE}/make-server-9255bd65/kv/${key}`, {
+      headers: { Authorization: `Bearer ${ANON}` },
+    });
+    if (!r.ok) return null;
+    const d = await r.json();
+    return d.value ?? null;
+  } catch { return null; }
 }
 
-async function cloudSet(key: string, value: any): Promise<void> {
-  await fetch(`${EDGE}/make-server-9255bd65/kv/${key}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${ANON}` },
-    body: JSON.stringify({ value }),
-  });
+async function dbSet(key: string, value: any): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const r = await fetch(`${EDGE}/make-server-9255bd65/kv/${key}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${ANON}` },
+      body: JSON.stringify({ value }),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      return { ok: false, error: d.error || `HTTP ${r.status}` };
+    }
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
 }
 
-// Starts with localStorage for instant render, fetches cloud on mount, writes to both.
-// Cloud always wins on mount — ensures cross-device sync.
+// useStore: instant local render → load from DB on mount → save to DB on change
+// Realtime: supabase-js postgres_changes subscription + 10s polling as fallback
 function useStore<T>(key: string, defaultVal: T): [T, (v: T) => void] {
   const [val, setVal] = useState<T>(() => {
     try {
@@ -154,19 +172,38 @@ function useStore<T>(key: string, defaultVal: T): [T, (v: T) => void] {
     } catch { return defaultVal; }
   });
 
+  const applyCloud = (cloudVal: any) => {
+    if (cloudVal === null || cloudVal === undefined) return;
+    const cloudStr = JSON.stringify(cloudVal);
+    if (cloudStr === localStorage.getItem(key)) return;
+    setVal(cloudVal);
+    localStorage.setItem(key, cloudStr);
+  };
+
   useEffect(() => {
-    cloudGet(key).then(cloudVal => {
-      if (cloudVal !== null && cloudVal !== undefined) {
-        setVal(cloudVal);
-        localStorage.setItem(key, JSON.stringify(cloudVal));
-      }
-    }).catch(() => {});
+    // Initial load from DB
+    dbGet(key).then(applyCloud);
+
+    // Supabase Realtime: fires instantly when another device saves
+    const channel = sb
+      .channel(`kv-${key}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: KV_TABLE, filter: `key=eq.${key}` },
+        (payload: any) => applyCloud(payload.new?.value)
+      )
+      .subscribe();
+
+    // Polling fallback: every 8s re-fetch in case realtime isn't enabled on table
+    const poll = setInterval(() => dbGet(key).then(applyCloud), 8000);
+
+    return () => { sb.removeChannel(channel); clearInterval(poll); };
   }, [key]);
 
   const set = (v: T) => {
     setVal(v);
     localStorage.setItem(key, JSON.stringify(v));
-    cloudSet(key, v).catch(() => {});
+    dbSet(key, v).then(res => {
+      if (!res.ok) toast.error("Erro ao salvar: verifique o deploy do servidor.");
+    });
   };
 
   return [val, set];
