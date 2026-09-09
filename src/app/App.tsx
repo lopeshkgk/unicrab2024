@@ -124,7 +124,28 @@ const DEFAULT_EDITAIS: Edital[] = [
   },
 ];
 
-// ─── localStorage helpers ─────────────────────────────────────────────────────
+// ─── Supabase Cloud Store ─────────────────────────────────────────────────────
+const EDGE = "https://mabvcstrksqmcdkozkwv.supabase.co/functions/v1/server";
+const ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1hYnZjc3Rya3NxbWNka296a3d2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg5MTk4NDMsImV4cCI6MjEwNDQ5NTg0M30.DMjCZt2NgNtPXJyyXLNvLZWKwOjY_09CrV6XXfUUHOk";
+
+async function cloudGet(key: string): Promise<any> {
+  const r = await fetch(`${EDGE}/make-server-9255bd65/kv/${key}`, {
+    headers: { Authorization: `Bearer ${ANON}` },
+  });
+  const d = await r.json();
+  return d.value ?? null;
+}
+
+async function cloudSet(key: string, value: any): Promise<void> {
+  await fetch(`${EDGE}/make-server-9255bd65/kv/${key}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${ANON}` },
+    body: JSON.stringify({ value }),
+  });
+}
+
+// Starts with localStorage for instant render, fetches cloud on mount, writes to both.
+// Cloud always wins on mount — ensures cross-device sync.
 function useStore<T>(key: string, defaultVal: T): [T, (v: T) => void] {
   const [val, setVal] = useState<T>(() => {
     try {
@@ -132,21 +153,22 @@ function useStore<T>(key: string, defaultVal: T): [T, (v: T) => void] {
       return s ? JSON.parse(s) : defaultVal;
     } catch { return defaultVal; }
   });
+
+  useEffect(() => {
+    cloudGet(key).then(cloudVal => {
+      if (cloudVal !== null && cloudVal !== undefined) {
+        setVal(cloudVal);
+        localStorage.setItem(key, JSON.stringify(cloudVal));
+      }
+    }).catch(() => {});
+  }, [key]);
+
   const set = (v: T) => {
     setVal(v);
     localStorage.setItem(key, JSON.stringify(v));
-    // dispatch storage event so other tabs update
-    window.dispatchEvent(new StorageEvent("storage", { key, newValue: JSON.stringify(v) }));
+    cloudSet(key, v).catch(() => {});
   };
-  useEffect(() => {
-    const handler = (e: StorageEvent) => {
-      if (e.key === key && e.newValue) {
-        try { setVal(JSON.parse(e.newValue)); } catch {}
-      }
-    };
-    window.addEventListener("storage", handler);
-    return () => window.removeEventListener("storage", handler);
-  }, [key]);
+
   return [val, set];
 }
 
@@ -208,7 +230,7 @@ function Header() {
   }, []);
   return (
     <header className="fixed top-0 left-0 right-0 z-50 transition-all duration-300"
-      style={{ backgroundColor: scrolled ? C.green : "transparent", boxShadow: scrolled ? "0 2px 20px rgba(0,0,0,0.2)" : "none" }}>
+      style={{ backgroundColor: scrolled ? C.green : "rgba(11,104,33,0.82)", backdropFilter: "blur(6px)", boxShadow: scrolled ? "0 2px 20px rgba(0,0,0,0.2)" : "none" }}>
       <div className="max-w-7xl mx-auto px-4 md:px-8 flex items-center justify-between h-16 md:h-20">
         <a href="#"><UnicrabLogo size={36} white /></a>
         <nav className="hidden xl:flex items-center gap-0.5">
